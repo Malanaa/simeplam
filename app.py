@@ -58,23 +58,35 @@ def display_emails():
         msg = gmail.users().messages().get(userId="me", id=message["id"]).execute()
         email_content = get_email_content(msg)
         summary = summarize_email(email_content)
-        emails.append(
-            {
-                "subject": get_header(msg, "Subject"),
-                "from": get_header(msg, "From"),
-                "summary": summary,
-            }
-        )
+        emails.append({
+            "subject": get_header(msg, "Subject"),
+            "from": get_header(msg, "From"),
+            "summary": summary,
+            "id": message["id"],
+        })
 
-    # Combine all email content
-    all_email_content = "\n\n".join(
-        [f"Subject: {email['subject']}\nFrom: {email['from']}" for email in emails]
-    )
+    return render_template("emails.html", emails=emails)
 
-    # Generate a single summary for all emails
-    summary = generate_summary(all_email_content)
 
-    return render_template("emails.html", summary=summary)
+# Add this new route to handle viewing individual emails
+@app.route("/email/<email_id>")
+def view_email(email_id):
+    if "credentials" not in session:
+        return redirect("/")
+
+    credentials = Credentials(**session["credentials"])
+    gmail = build("gmail", "v1", credentials=credentials)
+
+    msg = gmail.users().messages().get(userId="me", id=email_id).execute()
+    email_content = get_email_content(msg)
+
+    email = {
+        "subject": get_header(msg, "Subject"),
+        "from": get_header(msg, "From"),
+        "content": email_content,
+    }
+
+    return render_template("email_view.html", email=email)
 
 
 def credentials_to_dict(credentials):
@@ -109,10 +121,9 @@ def get_email_content(message):
 
 
 def summarize_email(content):
-    openai.api_key = os.getenv("OPENAI_API_KEY")  # Use environment variable for OpenAI API key
+    openai.api_key = os.getenv("OPENAI_API_KEY")
 
-    # Truncate content if it's too long
-    max_content_length = 12000  # Adjust this value as needed
+    max_content_length = 8000  # Reduced from 12000
     if len(content) > max_content_length:
         content = content[:max_content_length] + "..."
 
@@ -122,16 +133,16 @@ def summarize_email(content):
             messages=[
                 {
                     "role": "system",
-                    "content": "Summarize the key points of this email in 2-3 sentences.",
+                    "content": "Summarize the key point of this email in one short sentence.",
                 },
                 {"role": "user", "content": f"Email content:\n\n{content}"},
             ],
-            max_tokens=100,
+            max_tokens=50,  # Reduced from 100
         )
         return response.choices[0].message["content"].strip()
     except openai.error.InvalidRequestError as e:
         print(f"Error summarizing email: {str(e)}")
-        return "Unable to summarize this email due to its length."
+        return "Unable to summarize this email."
 
 
 def generate_summary(content):
