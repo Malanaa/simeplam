@@ -1,31 +1,41 @@
 import os
+from functools import wraps
 from dotenv import load_dotenv
-
-load_dotenv()  # Load environment variables from .env file
-
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # For development only
-
-from flask import Flask, render_template, url_for, request, redirect, session
+from flask import Flask, render_template, request, redirect, session
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import openai
 import base64
+from cachetools import TTLCache
+
+# Load environment variables and configure settings
+load_dotenv()
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY")  # Use environment variable for secret key
+app.secret_key = os.getenv("FLASK_SECRET_KEY")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Set up OAuth 2.0 flow
-flow = Flow.from_client_secrets_file(
-    "credentials.json", scopes=["https://www.googleapis.com/auth/gmail.readonly"]
-)
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+flow = Flow.from_client_secrets_file("credentials.json", scopes=SCOPES)
 flow.redirect_uri = "http://127.0.0.1:5000/oauth2callback"
 
+# Cache setup
+email_cache = TTLCache(maxsize=100, ttl=300)  # Cache 100 emails for 5 minutes
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'credentials' not in session:
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return decorated_function
 
 @app.route("/")
 def index():
     return render_template("login.html")
-
 
 @app.route("/login")
 def login():
@@ -33,50 +43,47 @@ def login():
     session["state"] = state
     return redirect(authorization_url)
 
-
 @app.route("/oauth2callback")
 def oauth2callback():
     flow.fetch_token(authorization_response=request.url)
-    credentials = flow.credentials
-    session["credentials"] = credentials_to_dict(credentials)
+    session["credentials"] = credentials_to_dict(flow.credentials)
     return redirect("/emails")
 
-
 @app.route("/emails")
+@login_required
 def display_emails():
-    if "credentials" not in session:
-        return redirect("/")
-
-    credentials = Credentials(**session["credentials"])
-    gmail = build("gmail", "v1", credentials=credentials)
-
+    gmail = get_gmail_service()
     results = gmail.users().messages().list(userId="me", maxResults=10).execute()
     messages = results.get("messages", [])
 
     emails = []
     for message in messages:
-        msg = gmail.users().messages().get(userId="me", id=message["id"]).execute()
-        email_content = get_email_content(msg)
-        summary = summarize_email(email_content)
-        emails.append({
-            "subject": get_header(msg, "Subject"),
-            "from": get_header(msg, "From"),
-            "summary": summary,
-            "id": message["id"],
-        })
+        email_id = message["id"]
+        if email_id in email_cache:
+            emails.append(email_cache[email_id])
+        else:
+            msg = gmail.users().messages().get(userId="me", id=email_id).execute()
+            email_content = get_email_content(msg)
+            summary = summarize_email(email_content)
+            category = categorize_email(email_content)
+            sent_time = get_sent_time(msg)
+            email_data = {
+                "subject": get_header(msg, "Subject"),
+                "from": get_header(msg, "From"),
+                "summary": summary,
+                "id": email_id,
+                "category": category,
+                "sent_time": sent_time,
+            }
+            email_cache[email_id] = email_data
+            emails.append(email_data)
 
     return render_template("emails.html", emails=emails)
 
-
-# Add this new route to handle viewing individual emails
 @app.route("/email/<email_id>")
+@login_required
 def view_email(email_id):
-    if "credentials" not in session:
-        return redirect("/")
-
-    credentials = Credentials(**session["credentials"])
-    gmail = build("gmail", "v1", credentials=credentials)
-
+    gmail = get_gmail_service()
     msg = gmail.users().messages().get(userId="me", id=email_id).execute()
     email_content = get_email_content(msg)
 
@@ -88,7 +95,6 @@ def view_email(email_id):
 
     return render_template("email_view.html", email=email)
 
-
 def credentials_to_dict(credentials):
     return {
         "token": credentials.token,
@@ -99,74 +105,76 @@ def credentials_to_dict(credentials):
         "scopes": credentials.scopes,
     }
 
+def get_gmail_service():
+    credentials = Credentials(**session["credentials"])
+    return build("gmail", "v1", credentials=credentials)
 
 def get_header(message, name):
-    headers = message["payload"]["headers"]
-    return next((header["value"] for header in headers if header["name"] == name), "")
-
+    return next((header["value"] for header in message["payload"]["headers"] if header["name"] == name), "")
 
 def get_email_content(message):
     parts = message["payload"].get("parts", [])
-    body = ""
+    
     if parts:
         for part in parts:
             if part["mimeType"] == "text/plain":
-                body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
-                break
-    else:
-        body = base64.urlsafe_b64decode(message["payload"]["body"]["data"]).decode(
-            "utf-8"
-        )
-    return body[:4000]  # Limit to first 4000 characters
+                return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")[:4000]
+    
+    return base64.urlsafe_b64decode(message["payload"]["body"]["data"]).decode("utf-8")[:4000]
 
-
-def summarize_email(content):
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-
-    max_content_length = 8000  # Reduced from 12000
-    if len(content) > max_content_length:
-        content = content[:max_content_length] + "..."
+def summarize_email(content, max_tokens=50):
+    instruction = "Summarize the key point of this email in one short sentence."
+    content = content[:8000] + "..." if len(content) > 8000 else content
 
     try:
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Summarize the key point of this email in one short sentence.",
-                },
+                {"role": "system", "content": instruction},
                 {"role": "user", "content": f"Email content:\n\n{content}"},
             ],
-            max_tokens=50,  # Reduced from 100
+            max_tokens=max_tokens,
         )
         return response.choices[0].message["content"].strip()
     except openai.error.InvalidRequestError as e:
         print(f"Error summarizing email: {str(e)}")
-        return "Unable to summarize this email."
+        words = content.split()
+        return f"Summary unavailable. Preview: {' '.join(words[:30])}..." if len(words) > 30 else content
 
+def categorize_email(content):
+    instruction = "Categorize this email as exactly one of the following: 'Advertisement', 'Work', 'Entertainment', 'Education', or 'Personal'. Use only these exact words."
+    content = content[:8000] + "..." if len(content) > 8000 else content
 
-def generate_summary(content):
-    # Set up OpenAI API
-    openai.api_key = os.getenv("OPENAI_API_KEY")  # Use environment variable for OpenAI API key
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": f"Email content:\n\n{content}"},
+            ],
+            max_tokens=15,
+            temperature=0.3,
+        )
+        category = response.choices[0].message["content"].strip()
+        
+        # Ensure the category is one of the specified options
+        valid_categories = ["Advertisement", "Work", "Entertainment", "Education", "Personal"]
+        if category not in valid_categories:
+            return "Personal"  # Default to Personal if the API returns an invalid category
+        
+        return category
+    except openai.error.InvalidRequestError as e:
+        print(f"Error categorizing email: {str(e)}")
+        return "Personal"  # Default to Personal in case of an error
 
-    # Generate summary using GPT-3.5-turbo
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that summarizes emails.",
-            },
-            {
-                "role": "user",
-                "content": f"Please provide a concise summary of the following emails:\n\n{content}",
-            },
-        ],
-        max_tokens=150,  # Adjust this value to control the length of the summary
-    )
+def get_sent_time(message):
+    sent_time = get_header(message, "Date")
+    return sent_time
 
-    return response.choices[0].message["content"].strip()
-
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
