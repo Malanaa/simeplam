@@ -1,7 +1,7 @@
 import os
 from functools import wraps
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, redirect, session
+from flask import Flask, render_template, request, redirect, session, url_for
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -52,9 +52,17 @@ def oauth2callback():
 @app.route("/emails")
 @login_required
 def display_emails():
+    page = request.args.get('page', 1, type=int)
+    per_page = 10
     gmail = get_gmail_service()
-    results = gmail.users().messages().list(userId="me", maxResults=10).execute()
+    
+    # Calculate the start index for the current page
+    start_index = (page - 1) * per_page
+
+    # Fetch messages for the current page
+    results = gmail.users().messages().list(userId="me", maxResults=per_page, pageToken=get_page_token(start_index)).execute()
     messages = results.get("messages", [])
+    next_page_token = results.get("nextPageToken")
 
     emails = []
     for message in messages:
@@ -65,36 +73,23 @@ def display_emails():
             msg = gmail.users().messages().get(userId="me", id=email_id).execute()
             email_content = get_email_content(msg)
             summary = summarize_email(email_content)
+            description = describe_email(email_content)
             category = categorize_email(email_content)
             sent_time = get_sent_time(msg)
             spooky = category in ["Work", "Education"]
             email_data = {
                 "subject": summary,
+                "description": description,
                 "from": get_header(msg, "From"),
                 "id": email_id,
                 "category": category,
                 "sent_time": sent_time,
-                "spooky": spooky,  # Add the spooky key
+                "spooky": spooky,
             }
             email_cache[email_id] = email_data
             emails.append(email_data)
 
-    return render_template("emails.html", emails=emails)
-
-@app.route("/email/<email_id>")
-@login_required
-def view_email(email_id):
-    gmail = get_gmail_service()
-    msg = gmail.users().messages().get(userId="me", id=email_id).execute()
-    email_content = get_email_content(msg)
-
-    email = {
-        "subject": get_header(msg, "Subject"),
-        "from": get_header(msg, "From"),
-        "content": email_content,
-    }
-
-    return render_template("email_view.html", email=email)
+    return render_template("emails.html", emails=emails, page=page, next_page_token=next_page_token)
 
 def credentials_to_dict(credentials):
     return {
@@ -123,8 +118,8 @@ def get_email_content(message):
     
     return base64.urlsafe_b64decode(message["payload"]["body"]["data"]).decode("utf-8")[:4000]
 
-def summarize_email(content, max_tokens=20):
-    instruction = "Summarize the main topic of this email in 8 words or less, as if it were a concise email subject."
+def summarize_email(content, max_tokens=30):
+    instruction = "Summarize the main topic of this email in a casual, slang-like way. Use first-person perspective as if you're the recipient. Keep it under 10 words if possible, but include all important info."
     content = content[:8000] + "..." if len(content) > 8000 else content
 
     try:
@@ -135,13 +130,32 @@ def summarize_email(content, max_tokens=20):
                 {"role": "user", "content": f"Email content:\n\n{content}"},
             ],
             max_tokens=max_tokens,
-            temperature=0.7,
+            temperature=0.8,
         )
         return response.choices[0].message["content"].strip()
     except openai.error.InvalidRequestError as e:
         print(f"Error summarizing email: {str(e)}")
         words = content.split()
-        return ' '.join(words[:8]) + "..." if len(words) > 8 else ' '.join(words)
+        return 'I got an email saying: ' + ' '.join(words[:6]) + "..." if len(words) > 6 else ' '.join(words)
+
+def describe_email(content, max_tokens=50):
+    instruction = "Create a humorous or super interesting description of this email in one or two sentences. Use first-person perspective as if you're the recipient. Include important parts and use casual human slang."
+    content = content[:8000] + "..." if len(content) > 8000 else content
+
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": f"Email content:\n\n{content}"},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.9,
+        )
+        return response.choices[0].message["content"].strip()
+    except openai.error.InvalidRequestError as e:
+        print(f"Error describing email: {str(e)}")
+        return "Yo, I got this wild email. You gotta check it out!"
 
 def categorize_email(content):
     instruction = "Categorize this email as exactly one of the following: 'Advertisement', 'Work', 'Entertainment', 'Education', or 'Personal'. Use only these exact words."
@@ -177,6 +191,14 @@ def get_sent_time(message):
 def logout():
     session.clear()
     return redirect("/")
+
+def get_page_token(start_index):
+    if start_index == 0:
+        return None
+    
+    gmail = get_gmail_service()
+    results = gmail.users().messages().list(userId="me", maxResults=start_index).execute()
+    return results.get("nextPageToken")
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
