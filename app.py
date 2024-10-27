@@ -67,13 +67,14 @@ def display_emails():
             summary = summarize_email(email_content)
             category = categorize_email(email_content)
             sent_time = get_sent_time(msg)
+            spooky = category in ["Work", "Education"]
             email_data = {
-                "subject": get_header(msg, "Subject"),
+                "subject": summary,
                 "from": get_header(msg, "From"),
-                "summary": summary,
                 "id": email_id,
                 "category": category,
                 "sent_time": sent_time,
+                "spooky": spooky,  # Add the spooky key
             }
             email_cache[email_id] = email_data
             emails.append(email_data)
@@ -122,8 +123,8 @@ def get_email_content(message):
     
     return base64.urlsafe_b64decode(message["payload"]["body"]["data"]).decode("utf-8")[:4000]
 
-def summarize_email(content, max_tokens=50):
-    instruction = "Summarize the key point of this email in one short sentence."
+def summarize_email(content, max_tokens=20):
+    instruction = "Summarize the main topic of this email in 8 words or less, as if it were a concise email subject."
     content = content[:8000] + "..." if len(content) > 8000 else content
 
     try:
@@ -134,12 +135,13 @@ def summarize_email(content, max_tokens=50):
                 {"role": "user", "content": f"Email content:\n\n{content}"},
             ],
             max_tokens=max_tokens,
+            temperature=0.7,
         )
         return response.choices[0].message["content"].strip()
     except openai.error.InvalidRequestError as e:
         print(f"Error summarizing email: {str(e)}")
         words = content.split()
-        return f"Summary unavailable. Preview: {' '.join(words[:30])}..." if len(words) > 30 else content
+        return ' '.join(words[:8]) + "..." if len(words) > 8 else ' '.join(words)
 
 def categorize_email(content):
     instruction = "Categorize this email as exactly one of the following: 'Advertisement', 'Work', 'Entertainment', 'Education', or 'Personal'. Use only these exact words."
